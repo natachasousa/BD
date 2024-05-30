@@ -8,7 +8,7 @@ from flask import Flask, jsonify, request
 from psycopg.rows import namedtuple_row
 
 # Use the DATABASE_URL environment variable if it exists, otherwise use the default.
-DATABASE_URL = os.environ.get("DATABASE_URL", "postgres://saude:1234@postgres/saude")
+DATABASE_URL = os.environ.get("DATABASE_URL", "postgres://postgres:postgres@postgres/postgres")
 
 dictConfig(
     {
@@ -65,95 +65,107 @@ def list_specialties(clinica):
 def list_doctors_and_availability(clinica, especialidade):
     with psycopg.connect(conninfo=DATABASE_URL, autocommit=True) as conn:
         with conn.cursor(row_factory=namedtuple_row) as cur:
-            doctors = cur.execute(
+            # Get all doctors of the specified specialty working at the specified clinic
+            cur.execute(
                 """
-                WITH future_appointments AS (
-                    SELECT DISTINCT ON (c.nif, c.data, c.hora) c.nif, c.data, c.hora
-                    FROM consulta c
-                    JOIN medico m ON c.nif = m.nif
-                    JOIN trabalha t ON m.nif = t.nif
-                    WHERE m.especialidade = %(especialidade)s 
-                    AND t.nome = %(clinica)s 
-                    AND (c.data, c.hora) > (CURRENT_DATE, CURRENT_TIME)
-                    ORDER BY c.data, c.hora
-                    LIMIT 3
-                )
-                SELECT m.nome, fa.data, fa.hora
+                SELECT DISTINCT m.nif, m.nome
                 FROM medico m
                 JOIN trabalha t ON m.nif = t.nif
-                JOIN future_appointments fa ON m.nif = fa.nif
-                WHERE m.especialidade = %(especialidade)s 
-                AND t.nome = %(clinica)s
-                ORDER BY fa.data, fa.hora;
+                WHERE m.especialidade = %s AND t.nome = %s
                 """,
-                {"clinica": clinica, "especialidade": especialidade},
-            ).fetchall()
-    return jsonify([
-        {
-            "nome": doctor.nome,
-            "data": doctor.data.isoformat(),
-            "hora": doctor.hora.strftime('%H:%M:%S')  # Converting time to string
-        } for doctor in doctors
-    ])
+                (especialidade, clinica)
+            )
+            doctors = cur.fetchall()
+
+            # Prepare a list to hold the final result
+            result = []
+
+            for doctor in doctors:
+                # Get the next 3 available appointment slots for the current doctor
+                cur.execute(
+                    """
+                    SELECT c.data, c.hora
+                    FROM consulta c
+                    WHERE c.nif = %s AND (c.data > CURRENT_DATE OR (c.data = CURRENT_DATE AND c.hora > CURRENT_TIME))
+                    ORDER BY c.data, c.hora
+                    LIMIT 3
+                    """,
+                    (doctor.nif,)
+                )
+                appointments = cur.fetchall()
+
+                for appointment in appointments:
+                    result.append({
+                        "nome": doctor.nome,
+                        "data": appointment.data.isoformat(),
+                        "hora": appointment.hora.strftime('%H:%M:%S')
+                    })
+    if not result:
+        return jsonify("Esta especialidade não se encontra nesta clínica.")
+    
+    return jsonify(result)
 
 
 
 @app.route("/a/<clinica>/registar/", methods=("POST",))
 def register_appointment(clinica):
-    paciente = request.json.get("paciente")
-    medico = request.json.get("medico")
-    datahora = request.json.get("datahora")
+    paciente = request.args.get("paciente")
+    medico = request.args.get("medico")
+    data = request.args.get("data")
+    hora = request.args.get("hora")
 
-    if not paciente or not medico or not datahora:
+    if not paciente or not medico or not data or not hora:
         return "Paciente, médico e data/hora são obrigatórios.", 400
-    if datahora <= datetime.now():
+    appointment_datetime = datetime.strptime(f"{data} {hora}", "%Y-%m-%d %H:%M:%S")
+    if appointment_datetime <= datetime.now():
         return "A data/hora da consulta deve ser no futuro.", 400
 
-    data = datahora.date()
-    hora = datahora.time()
-
-    with psycopg.connect(conninfo=DATABASE_URL) as conn:
+    with psycopg.connect(conninfo=DATABASE_URL, autocommit=True) as conn:
         with conn.cursor() as cur:
             try:
+                # Fetch the current maximum ID
+                cur.execute("SELECT COALESCE(MAX(id), 0) FROM consulta")
+                last_id = cur.fetchone()[0]
+                new_id = last_id + 1
+
                 cur.execute(
                     """
-                    INSERT INTO consulta (ssn, nif, data, hora, nome)
-                    VALUES (%(paciente)s, %(medico)s, %(data)s, %(hora)s, %(clinica)s)
+                    INSERT INTO consulta (id, ssn, nif, nome, data, hora, codigo_sns)
+                    VALUES (%(id)s, %(paciente)s, %(medico)s, %(clinica)s, %(data)s, %(hora)s, NULL)
                     ON CONFLICT (nif, data, hora) DO NOTHING;
                     """,
-                    {"paciente": paciente, "medico": medico, "data": data, "hora": hora, "clinica": clinica},
+                    {"id": new_id, "paciente": paciente, "medico": medico, "clinica": clinica, "data": data, "hora": hora},
                 )
                 if cur.rowcount == 0:
                     return "Conflito de agendamento: o médico já tem uma consulta marcada para essa data e hora.", 409
 
-                conn.commit()
             except Exception as e:
                 conn.rollback()
                 return str(e), 400
 
-    return "Consulta registrada com sucesso.", 201
+    return "Consulta registada com sucesso.", 201
 
 
 @app.route("/a/<clinica>/cancelar/", methods=("POST",))
 def cancel_appointment(clinica):
-    paciente = request.json.get("paciente")
-    medico = request.json.get("medico")
-    datahora = request.json.get("datahora")
+    paciente = request.args.get("paciente")
+    medico = request.args.get("medico")
+    data = request.args.get("data")
+    hora = request.args.get("hora")
 
-    if not paciente or not medico or not datahora:
+    if not paciente or not medico or not data or not hora:
         return "Paciente, médico e data/hora são obrigatórios.", 400
 
-    with psycopg.connect(conninfo=DATABASE_URL) as conn:
+    with psycopg.connect(conninfo=DATABASE_URL, autocommit=True) as conn:
         with conn.cursor() as cur:
             try:
                 cur.execute(
                     """
                     DELETE FROM consulta
-                    WHERE paciente = %(paciente)s AND medico = %(medico)s AND datahora = %(datahora)s AND clinica = %(clinica)s;
+                    WHERE ssn = %(paciente)s AND nif = %(medico)s AND nome = %(clinica)s AND data = %(data)s AND hora = %(hora)s;
                     """,
-                    {"paciente": paciente, "medico": medico, "datahora": datahora, "clinica": clinica},
+                    {"paciente": paciente, "medico": medico,"clinica": clinica ,"data": data, "hora": hora},
                 )
-                conn.commit()
             except Exception as e:
                 conn.rollback()
                 return str(e), 400
