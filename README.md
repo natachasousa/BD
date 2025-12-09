@@ -1,2 +1,1 @@
-# BD
-Realização de um projeto no âmbito da cadeira de Bases de Dados.
+Project developed in Database class @ IST
